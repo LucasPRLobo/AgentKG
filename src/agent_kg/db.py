@@ -6,6 +6,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
     conn  = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript("""
           CREATE TABLE IF NOT EXISTS nodes (
               id         TEXT PRIMARY KEY,
@@ -32,6 +33,14 @@ def init_db(path: str | Path) -> sqlite3.Connection:
       """)
     conn.commit()
     return conn
+
+
+def node_exists(conn: sqlite3.Connection, node_id: str, type: str | None = None) -> bool:
+    if type is None:
+        row = conn.execute("SELECT 1 FROM nodes WHERE id = ?", (node_id,)).fetchone()
+    else:
+        row = conn.execute("SELECT 1 FROM nodes WHERE id = ? AND type = ?", (node_id, type)).fetchone()
+    return row is not None
 
 
 def upsert_node(conn: sqlite3.Connection, node: Node) -> None:
@@ -90,8 +99,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10) -> list[dict]:
     return [dict(r) for r in obs_rows] + [dict(r) for r in node_rows]
 
 
-def get_context(conn: sqlite3.Connection, project_label: str, session_limit:
-int = 5) -> dict:
+def get_context(conn: sqlite3.Connection, project_label: str, session_limit: int = 5, obs_limit: int = 20) -> dict:
     project = conn.execute(
         "SELECT * FROM nodes WHERE type = 'project' AND label = ?",
         (project_label,)
@@ -102,16 +110,33 @@ int = 5) -> dict:
 
     sessions = conn.execute(
         """
-        SELECT id, label, body, created_at, updated_at
-        FROM nodes
-        WHERE type = 'session' AND project_id = ?
-        ORDER BY updated_at DESC
+        SELECT s.id, s.label, s.body, s.created_at, s.updated_at,
+               count(o.id) AS obs_count,
+               (s.body IS NULL) AS dangling
+        FROM nodes s
+        LEFT JOIN observations o ON o.session_id = s.id
+        WHERE s.type = 'session' AND s.project_id = ?
+        GROUP BY s.id
+        ORDER BY s.updated_at DESC
         LIMIT ?
         """,
         (project["id"], session_limit)
     ).fetchall()
 
+    observations = conn.execute(
+        """
+        SELECT o.id, o.session_id, o.content, o.created_at
+        FROM observations o
+        JOIN nodes s ON o.session_id = s.id
+        WHERE s.project_id = ?
+        ORDER BY o.created_at DESC
+        LIMIT ?
+        """,
+        (project["id"], obs_limit)
+    ).fetchall()
+
     return {
         "project": dict(project),
         "sessions": [dict(s) for s in sessions],
+        "observations": [dict(o) for o in observations],
     }
