@@ -45,9 +45,10 @@ def init_db(path: str | Path) -> sqlite3.Connection:
             
             supersedes      TEXT REFERENCES facts(id),  
             created_at      TEXT NOT NULL,
-            updated_at      TEXT NOT NULL        
+            updated_at      TEXT NOT NULL 
+        );    
                        
-        CREATE TABLE fact_sources (
+        CREATE TABLE IF NOT EXISTS fact_sources (
             fact_id        TEXT NOT NULL REFERENCES facts(id),
             observation_id TEXT NOT NULL REFERENCES observations(id),
             PRIMARY KEY (fact_id, observation_id)
@@ -59,6 +60,17 @@ def init_db(path: str | Path) -> sqlite3.Connection:
             content_rowid=rowid
         );
       """)
+    
+    # Migration
+    for table, col, decl in [
+        ("observations", "scope",       "TEXT"),
+        ("observations", "agent_id",    "TEXT"),
+        ("observations", "promoted_to", "TEXT"),
+        ("nodes",        "status",      "TEXT"),]:
+          
+            if not _has_column(conn, table, col):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
     conn.commit()
     return conn
 
@@ -168,3 +180,7 @@ def get_context(conn: sqlite3.Connection, project_label: str, session_limit: int
         "sessions": [dict(s) for s in sessions],
         "observations": [dict(o) for o in observations],
     }
+
+
+def _has_column(conn, table, col):
+    return any(r["name"] == col for r in conn.execute(f"SELECT name FROM pragma_table_info('{table}')"))
