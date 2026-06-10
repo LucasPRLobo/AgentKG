@@ -1,6 +1,6 @@
 import sqlite3
 from pathlib import Path
-from .models import Node, Observation
+from .models import Node, Observation, Fact
 
 
 def init_db(path: str | Path) -> sqlite3.Connection:
@@ -228,3 +228,31 @@ def get_context(conn: sqlite3.Connection, project_label: str, session_limit: int
         "sessions": [dict(s) for s in sessions],
         "observations": [dict(o) for o in observations],
     }
+
+def create_fact(conn: sqlite3.Connection, fact: Fact, source_obs_ids: list[str]) -> None:
+    conn.execute(
+        """
+        INSERT INTO facts (id, scope, statement, subject, predicate, object,
+                            t_created, t_invalid, valid_from, valid_until,
+                            confidence, recurrence_count, last_confirmed_at,
+                            supersedes, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (fact.id, fact.scope, fact.statement, fact.subject, fact.predicate, fact.object,
+        fact.t_created.isoformat(),
+        fact.t_invalid.isoformat() if fact.t_invalid else None,
+        fact.valid_from.isoformat() if fact.valid_from else None,
+        fact.valid_until.isoformat() if fact.valid_until else None,
+        fact.confidence, fact.recurrence_count, fact.last_confirmed_at.isoformat(),
+        fact.supersedes, fact.created_at.isoformat(), fact.updated_at.isoformat()),
+    )
+    for obs_id in source_obs_ids:
+        conn.execute(
+            "INSERT INTO fact_sources (fact_id, observation_id) VALUES (?, ?)",
+            (fact.id, obs_id),
+        )
+        conn.execute(
+            "UPDATE observations SET promoted_to = ? WHERE id = ?",
+            (fact.id, obs_id),
+        )
+    conn.commit()
