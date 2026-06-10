@@ -71,8 +71,29 @@ def init_db(path: str | Path) -> sqlite3.Connection:
             if not _has_column(conn, table, col):
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
+    _backfill(conn)
     conn.commit()
     return conn
+
+
+def _backfill(conn: sqlite3.Connection) -> None:
+    # scope <- project label reached via session -> project
+    conn.execute("""
+        UPDATE observations
+        SET scope = (
+            SELECT p.label
+            FROM nodes s
+            JOIN nodes p ON s.project_id = p.id
+            WHERE s.id = observations.session_id
+        )
+        WHERE scope IS NULL
+    """)
+    # status <- 'open' if never closed (no summary), else 'closed'
+    conn.execute("""
+        UPDATE nodes
+        SET status = CASE WHEN body IS NULL THEN 'open' ELSE 'closed' END
+        WHERE type = 'session' AND status IS NULL
+    """)
 
 
 def node_exists(conn: sqlite3.Connection, node_id: str, type: str | None = None) -> bool:
@@ -184,3 +205,25 @@ def get_context(conn: sqlite3.Connection, project_label: str, session_limit: int
 
 def _has_column(conn, table, col):
     return any(r["name"] == col for r in conn.execute(f"SELECT name FROM pragma_table_info('{table}')"))
+
+def _backfill(conn):
+    # scope ← project label reached via session → project
+    conn.execute("""
+        UPDATE observations
+        SET scope = (
+            SELECT p.label
+            FROM nodes s
+            JOIN nodes p ON s.project_id = p.id
+              WHERE s.id = observations.session_id
+        )
+        WHERE scope IS NULL
+      """)
+      # status ← 'open' if never closed (no summary), else 'closed'
+    conn.execute("""
+        UPDATE nodes
+        SET status = CASE WHEN body IS NULL THEN 'open' ELSE 'closed' END
+        WHERE type = 'session' AND status IS NULL
+    """)
+                
+                 
+               
