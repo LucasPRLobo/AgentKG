@@ -8,28 +8,56 @@ def init_db(path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript("""
-          CREATE TABLE IF NOT EXISTS nodes (
-              id         TEXT PRIMARY KEY,
-              type       TEXT NOT NULL,
-              label      TEXT NOT NULL,
-              body       TEXT,
-              project_id TEXT REFERENCES nodes(id),
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-          );
+        CREATE TABLE IF NOT EXISTS nodes (
+            id         TEXT PRIMARY KEY,
+            type       TEXT NOT NULL,
+            label      TEXT NOT NULL,
+            body       TEXT,
+            project_id TEXT REFERENCES nodes(id),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
 
-          CREATE TABLE IF NOT EXISTS observations (
-              id         TEXT PRIMARY KEY,
-              session_id TEXT NOT NULL REFERENCES nodes(id),
-              content    TEXT NOT NULL,
-              created_at TEXT NOT NULL
-          );
+        CREATE TABLE IF NOT EXISTS observations (
+            id         TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES nodes(id),
+            content    TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+                    
+        CREATE TABLE IF NOT EXISTS facts (
+            id         TEXT PRIMARY KEY,
+            scope      TEXT NOT NULL,
+            statement  TEXT NOT NULL,
+                       
+            subject     TEXT,
+            predicate   TEXT,
+            object      TEXT,
+                       
+            t_created   TEXT NOT NULL,
+            t_invalid   TEXT,
+            valid_from  TEXT,
+            valid_until TEXT,
+                       
+            confidence  REAL NOT NULL DEFAULT 1.0,
+            recurrence_count INTEGER NOT NULL DEFAULT 1,
+            last_confirmed_at TEXT NOT NULL,
+            
+            supersedes      TEXT REFERENCES facts(id),  
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL        
+                       
+        CREATE TABLE fact_sources (
+            fact_id        TEXT NOT NULL REFERENCES facts(id),
+            observation_id TEXT NOT NULL REFERENCES observations(id),
+            PRIMARY KEY (fact_id, observation_id)
+        );        
 
-          CREATE VIRTUAL TABLE IF NOT EXISTS obs_fts USING fts5(
-              content,
-              content=observations,
-              content_rowid=rowid
-          );
+        CREATE VIRTUAL TABLE IF NOT EXISTS obs_fts USING fts5(
+            content,
+            content=observations,
+            content_rowid=rowid
+        );
       """)
     conn.commit()
     return conn
