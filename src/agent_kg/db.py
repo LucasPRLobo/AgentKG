@@ -1,7 +1,11 @@
 import sqlite3
+import math
+import datetime
 from pathlib import Path
 from .models import Node, Observation, Fact
 
+
+LAMBDA = math.log(2) / 90  # 90-day half-life
 
 def init_db(path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
@@ -256,3 +260,9 @@ def create_fact(conn: sqlite3.Connection, fact: Fact, source_obs_ids: list[str])
             (fact.id, obs_id),
         )
     conn.commit()
+
+
+
+def effective_confidence(base: float, last_confirmed_at: datetime, now: datetime) -> float:
+    age_days = (now - last_confirmed_at).total_seconds() / 86400
+    return base * math.exp(-LAMBDA * age_days)
