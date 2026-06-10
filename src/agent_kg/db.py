@@ -226,4 +226,16 @@ def _backfill(conn):
     """)
                 
                  
-               
+def mint_id(conn: sqlite3.Connection, kind: str, scope: str) -> str:
+    # kind ∈ {'o','s','f'}; fact counter is global, so scope='global' for facts
+    conn.execute(
+        "INSERT INTO counters (scope, kind, n) VALUES (?, ?, 1) "
+        "ON CONFLICT(scope, kind) DO UPDATE SET n = n + 1",
+        (scope, kind),
+    )
+    n = conn.execute(
+        "SELECT n FROM counters WHERE scope = ? AND kind = ?", (scope, kind)
+    ).fetchone()["n"]
+    if kind == "f":
+        return f"f{n}"
+    return f"{scope}/{kind}{n}"
