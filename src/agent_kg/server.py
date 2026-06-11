@@ -4,7 +4,10 @@ from pathlib import Path
 import sqlite3
 
 from mcp.server.fastmcp import FastMCP
-from .db import init_db, upsert_node, create_observation, search, get_context, node_exists, mint_id
+from .db import (
+    init_db, upsert_node, create_observation, search, get_context, node_exists, mint_id,
+    remember as db_remember, recall as db_recall, forget as db_forget,
+)
 from .models import Node, Observation
 
 
@@ -148,10 +151,54 @@ def search_memory(query: str, limit: int = 10) -> list[dict]:
 @mcp.tool()
 def get_project_context(project: str) -> dict:
     """
-    Load context for a project at the start of a session. Returns recent
-    session summaries and observations. Call this before starting work.
+    Load context at the start of a session. Returns recent session summaries,
+    recent observations, your global (user-level) facts, and this project's
+    facts. Call this before starting work to orient yourself.
     """
     return get_context(conn, project)
+
+
+@mcp.tool()
+def remember(scope: str, statement: str, confidence: float = 1.0) -> str:
+    """
+    Store a durable fact worth keeping across sessions: a user preference, a
+    convention, or a settled project decision. Use scope='global' for
+    user-level knowledge that applies everywhere (preferences, working style),
+    or a project name for a fact specific to that project. Returns the fact id.
+    """
+    return db_remember(conn, scope, statement, confidence)
+
+
+@mcp.tool()
+def recall(query: str, scope: str | None = None, as_of: str | None = None, limit: int = 10) -> list[dict]:
+    """
+    Search durable facts (not raw observations), ranked by confidence. Pass a
+    project name as scope to get that project's facts plus your global facts.
+    Pass as_of (an ISO-8601 timestamp) to see what was believed at a past time.
+    """
+    parsed = None
+    if as_of is not None:
+        try:
+            parsed = datetime.fromisoformat(as_of)
+        except ValueError:
+            raise ValueError(
+                f"as_of must be an ISO-8601 timestamp "
+                f"(e.g. 2026-06-11T00:00:00+00:00), got '{as_of}'."
+            )
+    return db_recall(conn, query, scope=scope, as_of=parsed, limit=limit)
+
+
+@mcp.tool()
+def forget(fact_id: str) -> str:
+    """
+    Soft-invalidate a fact that is no longer true. It stops appearing in recall
+    going forward but is preserved for point-in-time history. Returns a
+    confirmation.
+    """
+    if not conn.execute("SELECT 1 FROM facts WHERE id = ?", (fact_id,)).fetchone():
+        raise ValueError(f"Unknown fact id '{fact_id}'. Use recall to find the right id.")
+    db_forget(conn, fact_id)
+    return f"Fact '{fact_id}' forgotten."
 
 
 if __name__ == "__main__":

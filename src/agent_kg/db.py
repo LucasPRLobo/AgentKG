@@ -194,20 +194,47 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 10) -> list[dict]:
     return [dict(r) for r in obs_rows] + [dict(r) for r in node_rows]
 
 
-def get_context(conn: sqlite3.Connection, project_label: str, session_limit: int = 5, obs_limit: int = 20) -> dict:
+def _rank_live_facts(conn: sqlite3.Connection, scope_exact: str, limit: int, now: datetime) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM facts WHERE scope = ? AND t_invalid IS NULL",
+        (scope_exact,),
+    ).fetchall()
+    out = []
+    for row in rows:
+        d = dict(row)
+        last = datetime.fromisoformat(d["last_confirmed_at"])
+        d["effective_confidence"] = effective_confidence(d["confidence"], last, now)
+        out.append(d)
+    out.sort(key=lambda d: d["effective_confidence"], reverse=True)
+    return out[:limit]
+
+
+def get_context(conn: sqlite3.Connection, project_label: str, session_limit: int = 5,
+                obs_limit: int = 20, fact_limit: int = 10) -> dict:
+    now = datetime.now(timezone.utc)
+    # facts are scoped by label, independent of whether a project node exists
+    global_facts = _rank_live_facts(conn, "global", fact_limit, now)
+    project_facts = _rank_live_facts(conn, project_label, fact_limit, now)
+
     project = conn.execute(
         "SELECT * FROM nodes WHERE type = 'project' AND label = ?",
         (project_label,)
     ).fetchone()
 
     if not project:
-        return {"project": None, "sessions": []}
+        return {
+            "project": None,
+            "sessions": [],
+            "observations": [],
+            "global_facts": global_facts,
+            "project_facts": project_facts,
+        }
 
     sessions = conn.execute(
         """
-        SELECT s.id, s.label, s.body, s.created_at, s.updated_at,
+        SELECT s.id, s.label, s.body, s.status, s.created_at, s.updated_at,
                count(o.id) AS obs_count,
-               (s.body IS NULL) AS dangling
+               (s.status = 'open') AS dangling
         FROM nodes s
         LEFT JOIN observations o ON o.session_id = s.id
         WHERE s.type = 'session' AND s.project_id = ?
@@ -234,6 +261,8 @@ def get_context(conn: sqlite3.Connection, project_label: str, session_limit: int
         "project": dict(project),
         "sessions": [dict(s) for s in sessions],
         "observations": [dict(o) for o in observations],
+        "global_facts": global_facts,
+        "project_facts": project_facts,
     }
 
 def create_fact(conn: sqlite3.Connection, fact: Fact, source_obs_ids: list[str]) -> None:
