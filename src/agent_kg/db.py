@@ -1,6 +1,6 @@
 import sqlite3
 import math
-import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from .models import Node, Observation, Fact
 
@@ -266,3 +266,52 @@ def create_fact(conn: sqlite3.Connection, fact: Fact, source_obs_ids: list[str])
 def effective_confidence(base: float, last_confirmed_at: datetime, now: datetime) -> float:
     age_days = (now - last_confirmed_at).total_seconds() / 86400
     return base * math.exp(-LAMBDA * age_days)
+
+
+def recall(conn: sqlite3.Connection, query: str, scope: str | None = None,
+           as_of: datetime | None = None, limit: int = 10) -> list[dict]:
+    as_of = as_of or datetime.now(timezone.utc)
+    as_of_iso = as_of.isoformat()
+
+    sql = """
+        SELECT * FROM facts
+        WHERE statement LIKE ?
+          AND t_created <= ?
+          AND (t_invalid IS NULL OR t_invalid > ?)
+    """
+    params: list = [f"%{query}%", as_of_iso, as_of_iso]
+    if scope is not None:
+        sql += " AND scope IN (?, 'global')"
+        params.append(scope)
+
+    rows = conn.execute(sql, params).fetchall()
+
+    results = []
+    for row in rows:
+        d = dict(row)
+        last = datetime.fromisoformat(d["last_confirmed_at"])
+        d["effective_confidence"] = effective_confidence(d["confidence"], last, as_of)
+        results.append(d)
+
+    results.sort(key=lambda d: d["effective_confidence"], reverse=True)
+    return results[:limit]
+
+def remember(conn, scope, statement, confidence=1.0, source_obs_ids=()):
+    now = datetime.now(timezone.utc)
+    fid = mint_id(conn, "f", "global")
+    fact = Fact(id=fid, scope=scope, statement=statement, confidence=confidence,
+                t_created=now, last_confirmed_at=now, created_at=now, updated_at=now)
+    create_fact(conn, fact, list(source_obs_ids))
+    return fid
+
+def forget(conn, fact_id):
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE facts SET t_invalid = ? WHERE id = ?", (now, fact_id))
+    conn.commit()
+
+def supersede(conn, old_id, new_fact):
+    conn.execute("UPDATE facts SET t_invalid = ? WHERE id = ?",
+                (new_fact.t_created.isoformat(), old_id))
+    new_fact.supersedes = old_id
+    create_fact(conn, new_fact, [])
+    conn.commit()
