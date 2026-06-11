@@ -138,14 +138,15 @@ def node_exists(conn: sqlite3.Connection, node_id: str, type: str | None = None)
 def upsert_node(conn: sqlite3.Connection, node: Node) -> None:
     conn.execute(
         """
-        INSERT INTO nodes (id, type, label, body, project_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO nodes (id, type, label, body, project_id, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             label      = excluded.label,
             body       = excluded.body,
+            status     = excluded.status,
             updated_at = excluded.updated_at
         """,
-        (node.id, node.type, node.label, node.body, node.project_id,
+        (node.id, node.type, node.label, node.body, node.project_id, node.status,
          node.created_at.isoformat(), node.updated_at.isoformat())
     )
     conn.commit()
@@ -153,8 +154,10 @@ def upsert_node(conn: sqlite3.Connection, node: Node) -> None:
 
 def create_observation(conn: sqlite3.Connection, obs: Observation) -> None:
     conn.execute(
-        "INSERT INTO observations (id, session_id, content, created_at) VALUES (?, ?, ?, ?)",
-        (obs.id, obs.session_id, obs.content, obs.created_at.isoformat())
+        "INSERT INTO observations (id, session_id, content, scope, agent_id, promoted_to, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (obs.id, obs.session_id, obs.content, obs.scope, obs.agent_id, obs.promoted_to,
+         obs.created_at.isoformat())
     )
     conn.execute(
         """

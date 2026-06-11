@@ -8,6 +8,7 @@ class Node(pydantic.BaseModel):
     label: str
     body:str | None =None
     project_id: str | None = None
+    status: str | None = None
     created_at: datetime
     updated_at: datetime
 
