@@ -14,6 +14,7 @@ from .db import (
     find_entity_candidates as db_find_entity_candidates, link_fact_entity as db_link_fact_entity,
     list_entities as db_list_entities, get_entity as db_get_entity,
     merge_entities as db_merge_entities, add_alias as db_add_alias,
+    find_similar_facts as db_find_similar_facts,
 )
 from .models import Node, Observation, Fact, Entity
 
@@ -156,11 +157,13 @@ def record_observation(project: str, content: str, session: str | None = None) -
 
 
 @mcp.tool()
-def end_session(project: str, summary: str, session: str | None = None) -> str:
+def end_session(project: str, summary: str, session: str | None = None) -> dict:
     """
-    Close a project's active session with a summary. The summary is what
-    future sessions retrieve via get_project_context — make it useful to a
-    future agent: what changed, what's in progress, what's next.
+    Close a project's active session with a summary. The summary is what future
+    sessions retrieve via get_project_context — make it useful to a future agent:
+    what changed, what's in progress, what's next. Returns the session's
+    observations plus a digest prompt: review them and `remember` any durable
+    facts NOW, before they're buried in the raw log.
     """
     session_id = _resolve_session(conn, project, session)
     now = _now()
@@ -172,7 +175,21 @@ def end_session(project: str, summary: str, session: str | None = None) -> str:
     node.status = "closed"
     node.updated_at = now
     upsert_node(conn, node)
-    return f"Session '{node.label}' closed with summary."
+
+    observations = db_list_observations(conn, session=session_id, limit=100)
+    result = {
+        "message": f"Session '{node.label}' closed with summary.",
+        "session_id": session_id,
+        "observations": observations,
+    }
+    if observations:
+        result["digest_hint"] = (
+            f"This session recorded {len(observations)} observation(s). Before moving "
+            "on, review them and `remember` any DURABLE facts (settled decisions, "
+            "constraints, preferences) — observations are the raw log; facts are what "
+            "future sessions recall. Don't let durable conclusions stay buried as observations."
+        )
+    return result
 
 
 @mcp.tool()
@@ -204,6 +221,9 @@ def remember(scope: str, statement: str, type: str = "other", confidence: float 
     every project). Returns the stored fact — check the scope/type landed as you
     intended; a `hint` is included if the statement looks misplaced.
     """
+    # surface possible duplicates/conflicts BEFORE the new fact exists (W4-1/W4-2)
+    similar = db_find_similar_facts(conn, scope, statement)
+
     fid = db_remember(conn, scope, statement, confidence, type=type)
     result = db_get_fact(conn, fid)
     if scope != "global" and _looks_user_level(statement):
@@ -211,6 +231,17 @@ def remember(scope: str, statement: str, type: str = "other", confidence: float 
             "This looks user-level (a preference / working style). If it applies "
             "across all projects, consider scope='global' and type='preference' so "
             "it surfaces everywhere via the profile."
+        )
+    if similar:
+        result["similar"] = [
+            {"id": s["id"], "type": s["type"], "statement": s["statement"],
+             "overlap": s["overlap"], "effective_confidence": s["effective_confidence"]}
+            for s in similar
+        ]
+        result["similar_hint"] = (
+            f"{len(similar)} existing fact(s) in scope '{scope}' overlap this one. "
+            "If this UPDATES/REPLACES one, call supersede(old_fact_id, ...) instead of "
+            "keeping both; if it's a DUPLICATE, forget the extra. Otherwise ignore."
         )
     # [[Name]] / [[type:Name]] in the statement auto-link the fact to entities
     links = _parse_wikilinks(statement)

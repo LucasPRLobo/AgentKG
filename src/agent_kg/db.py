@@ -1,11 +1,41 @@
 import sqlite3
 import math
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from .models import Node, Observation, Fact, Entity
 
 
 LAMBDA = math.log(2) / 90  # 90-day half-life
+
+
+def _tokens(s: str) -> set:
+    """Significant words (len>=4, lowercased) for cheap statement-overlap similarity."""
+    return {w for w in re.findall(r"[a-z0-9]+", s.lower()) if len(w) >= 4}
+
+
+def find_similar_facts(conn: sqlite3.Connection, scope: str, statement: str,
+                       limit: int = 5, min_overlap: int = 2) -> list[dict]:
+    """Live facts in the same scope that share >=min_overlap significant words with
+    `statement`. Crude token overlap on purpose — embedding similarity is deferred.
+    Used to surface possible duplicates/updates before writing a near-duplicate fact."""
+    toks = _tokens(statement)
+    if not toks:
+        return []
+    now = datetime.now(timezone.utc)
+    rows = conn.execute(
+        "SELECT * FROM facts WHERE scope = ? AND t_invalid IS NULL", (scope,)
+    ).fetchall()
+    scored = []
+    for r in rows:
+        d = dict(r)
+        overlap = len(toks & _tokens(d["statement"]))
+        if overlap >= min_overlap:
+            d = _enrich_fact(d, now)
+            d["overlap"] = overlap
+            scored.append(d)
+    scored.sort(key=lambda d: (d["overlap"], d["effective_confidence"]), reverse=True)
+    return scored[:limit]
 
 def init_db(path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
