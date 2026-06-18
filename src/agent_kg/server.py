@@ -7,8 +7,10 @@ from mcp.server.fastmcp import FastMCP
 from .db import (
     init_db, upsert_node, create_observation, search, get_context, node_exists, mint_id,
     remember as db_remember, recall as db_recall, forget as db_forget,
+    supersede as db_supersede, get_fact as db_get_fact, get_observation as db_get_observation,
+    list_facts as db_list_facts, list_observations as db_list_observations,
 )
-from .models import Node, Observation
+from .models import Node, Observation, Fact
 
 
 DB_PATH = Path(__file__).parent.parent.parent / "data" / "agent_kg.db"
@@ -101,12 +103,12 @@ def start_session(project: str, objective: str) -> str:
 
 
 @mcp.tool()
-def record_observation(project: str, content: str, session: str | None = None) -> str:
+def record_observation(project: str, content: str, session: str | None = None) -> dict:
     """
     Record something worth remembering this session: a decision, a constraint,
     a file's purpose. Pass the project name — the server attaches it to that
     project's active session automatically (no session id to track).
-    Returns the observation id.
+    Returns the stored observation (id, scope, session_id, content, timestamp).
     """
     session_id = _resolve_session(conn, project, session)
     obs = Observation(
@@ -117,7 +119,7 @@ def record_observation(project: str, content: str, session: str | None = None) -
         created_at=_now(),
     )
     create_observation(conn, obs)
-    return obs.id
+    return db_get_observation(conn, obs.id)
 
 
 @mcp.tool()
@@ -159,22 +161,28 @@ def get_project_context(project: str) -> dict:
 
 
 @mcp.tool()
-def remember(scope: str, statement: str, confidence: float = 1.0) -> str:
+def remember(scope: str, statement: str, confidence: float = 1.0) -> dict:
     """
     Store a durable fact worth keeping across sessions: a user preference, a
     convention, or a settled project decision. Use scope='global' for
     user-level knowledge that applies everywhere (preferences, working style),
-    or a project name for a fact specific to that project. Returns the fact id.
+    or a project name for a fact specific to that project. Returns the stored
+    fact (id, scope, statement, confidence, timestamps) — check the scope landed
+    as you intended.
     """
-    return db_remember(conn, scope, statement, confidence)
+    fid = db_remember(conn, scope, statement, confidence)
+    return db_get_fact(conn, fid)
 
 
 @mcp.tool()
 def recall(query: str, scope: str | None = None, as_of: str | None = None, limit: int = 10) -> list[dict]:
     """
-    Search durable facts (not raw observations), ranked by confidence. Pass a
-    project name as scope to get that project's facts plus your global facts.
-    Pass as_of (an ISO-8601 timestamp) to see what was believed at a past time.
+    Search durable facts (not raw observations), ranked by decayed confidence.
+    Scope modes: omit scope for global (user-level) facts only; pass a project
+    name for that project's facts PLUS your global facts; pass scope='all' to
+    search across every project. Pass as_of (an ISO-8601 timestamp) to see what
+    was believed at a past time. Each result includes effective_confidence and
+    age_days so you can judge staleness.
     """
     parsed = None
     if as_of is not None:
@@ -189,16 +197,61 @@ def recall(query: str, scope: str | None = None, as_of: str | None = None, limit
 
 
 @mcp.tool()
-def forget(fact_id: str) -> str:
+def supersede(old_fact_id: str, new_statement: str, scope: str | None = None,
+              confidence: float = 1.0) -> dict:
+    """
+    Replace a fact whose content has changed. Retires old_fact_id (soft-invalidated,
+    preserved for point-in-time history) and creates a new fact structurally linked
+    back to it via `supersedes`. Use this instead of forget+remember when a decision
+    or value evolved — it keeps the supersession chain queryable. Scope defaults to
+    the old fact's scope if omitted. Returns the new fact.
+    """
+    old = conn.execute("SELECT * FROM facts WHERE id = ?", (old_fact_id,)).fetchone()
+    if old is None:
+        raise ValueError(f"Unknown fact id '{old_fact_id}'. Use recall/list_facts to find it.")
+    now = _now()
+    new_fact = Fact(
+        id=mint_id(conn, "f", "global"),
+        scope=scope if scope is not None else old["scope"],
+        statement=new_statement,
+        confidence=confidence,
+        t_created=now, last_confirmed_at=now, created_at=now, updated_at=now,
+    )
+    db_supersede(conn, old_fact_id, new_fact)
+    return db_get_fact(conn, new_fact.id)
+
+
+@mcp.tool()
+def forget(fact_id: str) -> dict:
     """
     Soft-invalidate a fact that is no longer true. It stops appearing in recall
-    going forward but is preserved for point-in-time history. Returns a
-    confirmation.
+    going forward but is preserved for point-in-time history. Returns the
+    invalidated fact (now carrying t_invalid).
     """
     if not conn.execute("SELECT 1 FROM facts WHERE id = ?", (fact_id,)).fetchone():
         raise ValueError(f"Unknown fact id '{fact_id}'. Use recall to find the right id.")
     db_forget(conn, fact_id)
-    return f"Fact '{fact_id}' forgotten."
+    return db_get_fact(conn, fact_id)
+
+
+@mcp.tool()
+def list_facts(scope: str | None = None, include_invalid: bool = False, limit: int = 50) -> list[dict]:
+    """
+    Browse stored facts (enumerate, not search). Omit scope to list every scope;
+    pass a project name or 'global' to filter. Set include_invalid=True to also
+    show forgotten/superseded facts. Ordered newest first; each carries
+    effective_confidence and age_days.
+    """
+    return db_list_facts(conn, scope=scope, include_invalid=include_invalid, limit=limit)
+
+
+@mcp.tool()
+def list_observations(project: str | None = None, session: str | None = None, limit: int = 50) -> list[dict]:
+    """
+    Browse raw observations (enumerate, not search). Filter by project name and/or
+    a specific session id. Ordered newest first.
+    """
+    return db_list_observations(conn, project=project, session=session, limit=limit)
 
 
 if __name__ == "__main__":
