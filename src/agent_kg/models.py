@@ -23,8 +23,9 @@ class Observation(pydantic.BaseModel):
 
 class Fact(pydantic.BaseModel):
     id: str
-    scope: str 
-    statement: str 
+    scope: str
+    statement: str
+    type: str = "other"
     subject: str | None = None
     predicate: str | None = None
     object: str | None = None
