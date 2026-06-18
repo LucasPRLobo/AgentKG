@@ -1,3 +1,4 @@
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,8 +10,12 @@ from .db import (
     remember as db_remember, recall as db_recall, forget as db_forget,
     supersede as db_supersede, get_fact as db_get_fact, get_observation as db_get_observation,
     list_facts as db_list_facts, list_observations as db_list_observations,
+    upsert_entity as db_upsert_entity, find_entity_exact as db_find_entity_exact,
+    find_entity_candidates as db_find_entity_candidates, link_fact_entity as db_link_fact_entity,
+    list_entities as db_list_entities, get_entity as db_get_entity,
+    merge_entities as db_merge_entities, add_alias as db_add_alias,
 )
-from .models import Node, Observation, Fact
+from .models import Node, Observation, Fact, Entity
 
 
 DB_PATH = Path(__file__).parent.parent.parent / "data" / "agent_kg.db"
@@ -35,6 +40,21 @@ def _looks_user_level(statement: str) -> bool:
     """Heuristic: does this statement read like a cross-project user preference?"""
     s = statement.lower()
     return any(h in s for h in _USER_LEVEL_HINTS)
+
+
+_WIKILINK = re.compile(r"\[\[([^\]]+)\]\]")
+
+
+def _parse_wikilinks(statement: str) -> list[tuple[str, str]]:
+    """Parse [[Name]] -> (Name, 'concept') and [[type:Name]] -> (Name, type)."""
+    out = []
+    for m in _WIKILINK.findall(statement):
+        if ":" in m:
+            t, n = m.split(":", 1)
+            out.append((n.strip(), t.strip()))
+        else:
+            out.append((m.strip(), "concept"))
+    return out
 
 
 def _resolve_session(conn: sqlite3.Connection, project: str, session: str | None = None) -> str:
@@ -192,6 +212,16 @@ def remember(scope: str, statement: str, type: str = "other", confidence: float 
             "across all projects, consider scope='global' and type='preference' so "
             "it surfaces everywhere via the profile."
         )
+    # [[Name]] / [[type:Name]] in the statement auto-link the fact to entities
+    links = _parse_wikilinks(statement)
+    if links:
+        linked = []
+        for nm, ty in links:
+            ent = create_entity(nm, ty)
+            db_link_fact_entity(conn, fid, ent["id"], "about")
+            linked.append({"name": nm, "type": ty, "entity_id": ent["id"],
+                           "matched": ent.get("matched"), "candidates": ent.get("candidates")})
+        result["entity_links"] = linked
     return result
 
 
@@ -278,6 +308,100 @@ def list_observations(project: str | None = None, session: str | None = None, li
     a specific session id. Ordered newest first.
     """
     return db_list_observations(conn, project=project, session=session, limit=limit)
+
+
+@mcp.tool()
+def create_entity(name: str, type: str, scope: str = "global") -> dict:
+    """
+    Create or fetch a shared entity (person | paper | project | file | concept | other),
+    global by default so it's the same node across all projects. An exact (name, type)
+    match returns the existing entity. If a NEW entity is created but similarly-named
+    ones already exist, they are returned under `candidates` with a `hint` — entities
+    are NEVER auto-merged across different names; confirm with merge_entities yourself.
+    """
+    exact = db_find_entity_exact(conn, name, type)
+    if exact:
+        return {**exact, "matched": "exact"}
+    now = _now()
+    ent = Entity(id=mint_id(conn, "e", "global"), type=type, name=name, scope=scope,
+                 created_at=now, updated_at=now)
+    db_upsert_entity(conn, ent)
+    out = {**ent.model_dump(mode="json"), "matched": "created"}
+    candidates = db_find_entity_candidates(conn, name, type)
+    if candidates:
+        out["candidates"] = candidates
+        out["hint"] = (
+            f"Created a new {type} '{name}', but {len(candidates)} similarly-named "
+            f"{type}(s) already exist. If this is the same entity, call merge_entities — "
+            "agent-kg never auto-merges across different names."
+        )
+    return out
+
+
+@mcp.tool()
+def link_fact(fact_id: str, name: str, type: str, role: str = "about", scope: str = "global") -> dict:
+    """
+    Attach a fact to an entity, creating or finding the entity by (name, type). `role`
+    describes the relationship (about | mentions | authored_by | depends_on | ...).
+    Returns the link and the resolved entity; if a new entity was created alongside
+    similarly-named existing ones, they're surfaced as candidates (never auto-merged).
+    """
+    if not conn.execute("SELECT 1 FROM facts WHERE id = ?", (fact_id,)).fetchone():
+        raise ValueError(f"Unknown fact id '{fact_id}'. Use recall/list_facts to find it.")
+    entity = create_entity(name, type, scope)
+    db_link_fact_entity(conn, fact_id, entity["id"], role)
+    return {"fact_id": fact_id, "entity_id": entity["id"], "role": role, "entity": entity}
+
+
+@mcp.tool()
+def list_entities(type: str | None = None, scope: str | None = None, limit: int = 50) -> list[dict]:
+    """
+    Browse stored entities (enumerate, not search). Optionally filter by type
+    (person | paper | project | file | concept | other) and/or scope. Ordered newest first.
+    """
+    return db_list_entities(conn, type=type, scope=scope, limit=limit)
+
+
+@mcp.tool()
+def get_entity(name_or_id: str) -> dict:
+    """
+    Look up an entity by name, alias, or id and return EVERYTHING known about it:
+    the entity, its aliases, and all live facts linked to it ACROSS EVERY PROJECT,
+    plus facts_by_scope (which projects touch it). Follows merge redirects, so a
+    merged-away id still resolves. This is the cross-project shared view.
+    """
+    result = db_get_entity(conn, name_or_id)
+    if result is None:
+        raise ValueError(f"No entity found for '{name_or_id}'. Use list_entities to browse.")
+    return result
+
+
+@mcp.tool()
+def merge_entities(from_id: str, to_id: str) -> dict:
+    """
+    Merge two entities that are the SAME thing. Redirects from_id -> to_id
+    (non-destructive: the merged node is kept and invalidated, its name preserved as
+    an alias, fact links resolve through the redirect). Reversible. Call this
+    deliberately to confirm a duplicate surfaced as a candidate — agent-kg never
+    auto-merges. Returns the surviving entity's full view.
+    """
+    for eid in (from_id, to_id):
+        if not conn.execute("SELECT 1 FROM entities WHERE id = ?", (eid,)).fetchone():
+            raise ValueError(f"Unknown entity id '{eid}'. Use list_entities to find it.")
+    db_merge_entities(conn, from_id, to_id)
+    return db_get_entity(conn, to_id)
+
+
+@mcp.tool()
+def add_alias(entity_id: str, alias: str) -> dict:
+    """
+    Add an alternate name (sameAs / aka) to an entity so future lookups by that name
+    resolve to it. Returns the entity's full view.
+    """
+    if not conn.execute("SELECT 1 FROM entities WHERE id = ?", (entity_id,)).fetchone():
+        raise ValueError(f"Unknown entity id '{entity_id}'. Use list_entities to find it.")
+    db_add_alias(conn, entity_id, alias)
+    return db_get_entity(conn, entity_id)
 
 
 if __name__ == "__main__":
