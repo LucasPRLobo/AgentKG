@@ -119,18 +119,19 @@ Organizing principle: **every prose-protocol norm an agent can violate silently 
 
 ---
 
-## Wave 4 — Semantic / intelligence layer  → W2 (and W3 helps)
+## Wave 4 — Semantic / intelligence layer ✅ COMPLETE (verified on real-DB backup 2026-06-18)
+*Thin cut: token-overlap similarity (embeddings deferred); W4-2 surfaces possible conflicts via `similar` + offers supersede — true semantic contradiction detection deferred. W4-3 digest = server returns observations + nudge; the agent (the intelligence) promotes.*
 *Shared dependency: similarity matching. The remaining guardrails.*
 
-### ☐ W4-1 · Dedup / upsert on `remember`  *(guardrail)*
+### ☑ W4-1 · Dedup / upsert on `remember`  *(guardrail)*
 **How:** before insert, find similar existing facts (start: keyword/`LIKE` + same scope/type; later: embeddings). If a close match exists, return it with an `"existing": [...]` payload and ask whether to update vs create. Enforces the file-protocol's "check for existing first".
 **Done when:** near-duplicate facts are surfaced before a second one is written.
 
-### ☐ W4-2 · Conflict detection
+### ☑ W4-2 · Conflict detection
 **How:** on `remember`, if a new fact about the same subject/entity contradicts a live one, flag it (return both) rather than letting them silently coexist. Leans on W3 entities for "same subject". Pairs naturally with `supersede` (W1-1) as the resolution.
 **Done when:** contradictory facts are surfaced, with supersede offered as the fix.
 
-### ☐ W4-3 · Observation→fact digest at `end_session`
+### ☑ W4-3 · Observation→fact digest at `end_session`
 **How:** at `end_session`, scan the session's observations and PROPOSE durable facts (return candidates; don't auto-commit — same discipline). Counters the "everything stays an observation" failure mode the consumer + our own docs name.
 **Done when:** closing a session offers a short list of promotable facts.
 
