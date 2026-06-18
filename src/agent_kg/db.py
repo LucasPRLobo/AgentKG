@@ -199,12 +199,7 @@ def _rank_live_facts(conn: sqlite3.Connection, scope_exact: str, limit: int, now
         "SELECT * FROM facts WHERE scope = ? AND t_invalid IS NULL",
         (scope_exact,),
     ).fetchall()
-    out = []
-    for row in rows:
-        d = dict(row)
-        last = datetime.fromisoformat(d["last_confirmed_at"])
-        d["effective_confidence"] = effective_confidence(d["confidence"], last, now)
-        out.append(d)
+    out = [_enrich_fact(dict(row), now) for row in rows]
     out.sort(key=lambda d: d["effective_confidence"], reverse=True)
     return out[:limit]
 
@@ -224,6 +219,7 @@ def get_context(conn: sqlite3.Connection, project_label: str, session_limit: int
     if not project:
         return {
             "project": None,
+            "status": "new_project_no_prior_context",
             "sessions": [],
             "observations": [],
             "global_facts": global_facts,
@@ -312,19 +308,17 @@ def recall(conn: sqlite3.Connection, query: str, scope: str | None = None,
           AND (t_invalid IS NULL OR t_invalid > ?)
     """
     params: list = [f"%{query}%", as_of_iso, as_of_iso]
-    if scope is not None:
+    # scope modes: None -> global only; "<project>" -> project + global; "all" -> everything
+    if scope == "all":
+        pass
+    elif scope is None:
+        sql += " AND scope = 'global'"
+    else:
         sql += " AND scope IN (?, 'global')"
         params.append(scope)
 
     rows = conn.execute(sql, params).fetchall()
-
-    results = []
-    for row in rows:
-        d = dict(row)
-        last = datetime.fromisoformat(d["last_confirmed_at"])
-        d["effective_confidence"] = effective_confidence(d["confidence"], last, as_of)
-        results.append(d)
-
+    results = [_enrich_fact(dict(row), as_of) for row in rows]
     results.sort(key=lambda d: d["effective_confidence"], reverse=True)
     return results[:limit]
 
@@ -347,3 +341,58 @@ def supersede(conn, old_id, new_fact):
     new_fact.supersedes = old_id
     create_fact(conn, new_fact, [])
     conn.commit()
+
+
+def _enrich_fact(d: dict, as_of: datetime) -> dict:
+    """Add agent-facing derived fields to a raw fact row: decayed confidence + age."""
+    last = datetime.fromisoformat(d["last_confirmed_at"])
+    d["effective_confidence"] = effective_confidence(d["confidence"], last, as_of)
+    d["age_days"] = (as_of - last).total_seconds() / 86400
+    return d
+
+
+def get_fact(conn: sqlite3.Connection, fact_id: str) -> dict | None:
+    row = conn.execute("SELECT * FROM facts WHERE id = ?", (fact_id,)).fetchone()
+    if row is None:
+        return None
+    return _enrich_fact(dict(row), datetime.now(timezone.utc))
+
+
+def get_observation(conn: sqlite3.Connection, obs_id: str) -> dict | None:
+    row = conn.execute("SELECT * FROM observations WHERE id = ?", (obs_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_facts(conn: sqlite3.Connection, scope: str | None = None,
+               include_invalid: bool = False, limit: int = 50) -> list[dict]:
+    now = datetime.now(timezone.utc)
+    clauses, params = [], []
+    if not include_invalid:
+        clauses.append("t_invalid IS NULL")
+    if scope is not None and scope != "all":
+        clauses.append("scope = ?")
+        params.append(scope)
+    sql = "SELECT * FROM facts"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY t_created DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    return [_enrich_fact(dict(r), now) for r in rows]
+
+
+def list_observations(conn: sqlite3.Connection, project: str | None = None,
+                      session: str | None = None, limit: int = 50) -> list[dict]:
+    clauses, params = [], []
+    if session is not None:
+        clauses.append("session_id = ?")
+        params.append(session)
+    if project is not None:
+        clauses.append("scope = ?")
+        params.append(project)
+    sql = "SELECT * FROM observations"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
