@@ -34,6 +34,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
             id         TEXT PRIMARY KEY,
             scope      TEXT NOT NULL,
             statement  TEXT NOT NULL,
+            type       TEXT NOT NULL DEFAULT 'other',
 
             subject     TEXT,
             predicate   TEXT,
@@ -79,6 +80,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         ("observations", "agent_id",    "TEXT"),
         ("observations", "promoted_to", "TEXT"),
         ("nodes",        "status",      "TEXT"),
+        ("facts",        "type",        "TEXT NOT NULL DEFAULT 'other'"),
     ]:
         if not _has_column(conn, table, col):
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
@@ -210,6 +212,9 @@ def get_context(conn: sqlite3.Connection, project_label: str, session_limit: int
     # facts are scoped by label, independent of whether a project node exists
     global_facts = _rank_live_facts(conn, "global", fact_limit, now)
     project_facts = _rank_live_facts(conn, project_label, fact_limit, now)
+    # the user profile: global preference facts ("who is the user / how they work"),
+    # surfaced in EVERY project regardless of which one you're in
+    profile = list_facts(conn, scope="global", type="preference", limit=fact_limit)
 
     project = conn.execute(
         "SELECT * FROM nodes WHERE type = 'project' AND label = ?",
@@ -220,6 +225,7 @@ def get_context(conn: sqlite3.Connection, project_label: str, session_limit: int
         return {
             "project": None,
             "status": "new_project_no_prior_context",
+            "profile": profile,
             "sessions": [],
             "observations": [],
             "global_facts": global_facts,
@@ -255,6 +261,7 @@ def get_context(conn: sqlite3.Connection, project_label: str, session_limit: int
 
     return {
         "project": dict(project),
+        "profile": profile,
         "sessions": [dict(s) for s in sessions],
         "observations": [dict(o) for o in observations],
         "global_facts": global_facts,
@@ -264,13 +271,13 @@ def get_context(conn: sqlite3.Connection, project_label: str, session_limit: int
 def create_fact(conn: sqlite3.Connection, fact: Fact, source_obs_ids: list[str]) -> None:
     conn.execute(
         """
-        INSERT INTO facts (id, scope, statement, subject, predicate, object,
+        INSERT INTO facts (id, scope, statement, type, subject, predicate, object,
                             t_created, t_invalid, valid_from, valid_until,
                             confidence, recurrence_count, last_confirmed_at,
                             supersedes, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (fact.id, fact.scope, fact.statement, fact.subject, fact.predicate, fact.object,
+        (fact.id, fact.scope, fact.statement, fact.type, fact.subject, fact.predicate, fact.object,
         fact.t_created.isoformat(),
         fact.t_invalid.isoformat() if fact.t_invalid else None,
         fact.valid_from.isoformat() if fact.valid_from else None,
@@ -297,7 +304,7 @@ def effective_confidence(base: float, last_confirmed_at: datetime, now: datetime
 
 
 def recall(conn: sqlite3.Connection, query: str, scope: str | None = None,
-           as_of: datetime | None = None, limit: int = 10) -> list[dict]:
+           as_of: datetime | None = None, limit: int = 10, type: str | None = None) -> list[dict]:
     as_of = as_of or datetime.now(timezone.utc)
     as_of_iso = as_of.isoformat()
 
@@ -317,15 +324,19 @@ def recall(conn: sqlite3.Connection, query: str, scope: str | None = None,
         sql += " AND scope IN (?, 'global')"
         params.append(scope)
 
+    if type is not None:
+        sql += " AND type = ?"
+        params.append(type)
+
     rows = conn.execute(sql, params).fetchall()
     results = [_enrich_fact(dict(row), as_of) for row in rows]
     results.sort(key=lambda d: d["effective_confidence"], reverse=True)
     return results[:limit]
 
-def remember(conn, scope, statement, confidence=1.0, source_obs_ids=()):
+def remember(conn, scope, statement, confidence=1.0, type="other", source_obs_ids=()):
     now = datetime.now(timezone.utc)
     fid = mint_id(conn, "f", "global")
-    fact = Fact(id=fid, scope=scope, statement=statement, confidence=confidence,
+    fact = Fact(id=fid, scope=scope, statement=statement, type=type, confidence=confidence,
                 t_created=now, last_confirmed_at=now, created_at=now, updated_at=now)
     create_fact(conn, fact, list(source_obs_ids))
     return fid
@@ -364,7 +375,7 @@ def get_observation(conn: sqlite3.Connection, obs_id: str) -> dict | None:
 
 
 def list_facts(conn: sqlite3.Connection, scope: str | None = None,
-               include_invalid: bool = False, limit: int = 50) -> list[dict]:
+               include_invalid: bool = False, limit: int = 50, type: str | None = None) -> list[dict]:
     now = datetime.now(timezone.utc)
     clauses, params = [], []
     if not include_invalid:
@@ -372,6 +383,9 @@ def list_facts(conn: sqlite3.Connection, scope: str | None = None,
     if scope is not None and scope != "all":
         clauses.append("scope = ?")
         params.append(scope)
+    if type is not None:
+        clauses.append("type = ?")
+        params.append(type)
     sql = "SELECT * FROM facts"
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)

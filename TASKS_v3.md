@@ -53,25 +53,25 @@ Organizing principle: **every prose-protocol norm an agent can violate silently 
 
 ---
 
-## Wave 2 — Typed facts + profile · ~2–4 days
+## Wave 2 — Typed facts + profile ✅ COMPLETE (verified on real-DB backup 2026-06-18)
 *Typing is the backbone for profile + entity views + filtered recall.*
 
-### ☐ W2-1 · Add `type` column to `facts`  → W1
+### ☑ W2-1 · Add `type` column to `facts`  → W1
 **File:** `db.py` migration + `models.py`.
 **How:** additive guarded `ALTER TABLE facts ADD COLUMN type TEXT`. Port file-memory taxonomy: `preference | decision | constraint | reference | person | project | other`. Add `type: str = "other"` to `Fact` model. Backfill existing facts to `other` (or NULL).
 **Done when:** facts carry a type; migration idempotent; existing facts preserved.
 
-### ☐ W2-2 · `type` in remember/recall/list  → W2-1
+### ☑ W2-2 · `type` in remember/recall/list  → W2-1
 **File:** `server.py` + `db.py`.
 **How:** `remember(..., type="other")`; `recall(..., type=None)` and `list_facts(..., type=None)` filter by it. Update docstrings to enumerate the taxonomy.
 **Done when:** filtered recall by type works (e.g. all `decision` facts for a project).
 
-### ☐ W2-3 · First-class profile in `get_project_context`  → W2-1
+### ☑ W2-3 · First-class profile in `get_project_context`  → W2-1
 **File:** `db.py` `get_context`.
 **How:** assemble a `"profile"` key from global facts of type `preference`/`user`, returned in EVERY project. This is the "who is the user / how they work" view the vision depends on.
 **Done when:** every project's context includes the user profile, regardless of which project.
 
-### ☐ W2-4 · Scope/type nudge on `remember`  *(guardrail)*  → W2-1
+### ☑ W2-4 · Scope/type nudge on `remember`  *(guardrail)*  → W2-1
 **File:** `server.py`.
 **How:** heuristic — if `scope=<project>` but statement looks user-level (first-person preference patterns: "I prefer", "user wants", "working style", "always"/"never" about the user), include a `"hint": "looks user-level — consider scope='global'"` in the return. Don't block; nudge.
 **Done when:** the consumer's actual mistake (parking user-level facts in project scope) gets surfaced at write time.

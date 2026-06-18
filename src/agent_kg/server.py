@@ -24,6 +24,19 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+_USER_LEVEL_HINTS = (
+    "i prefer", "i like", "i want", "i don't", "i do not", "i always", "i never",
+    "my preference", "my workflow", "user prefers", "user wants", "user likes",
+    "working style", "prefers ", "likes to",
+)
+
+
+def _looks_user_level(statement: str) -> bool:
+    """Heuristic: does this statement read like a cross-project user preference?"""
+    s = statement.lower()
+    return any(h in s for h in _USER_LEVEL_HINTS)
+
+
 def _resolve_session(conn: sqlite3.Connection, project: str, session: str | None = None) -> str:
     """
     Resolve which session a write applies to. Agents pass `project`, NOT a
@@ -161,28 +174,38 @@ def get_project_context(project: str) -> dict:
 
 
 @mcp.tool()
-def remember(scope: str, statement: str, confidence: float = 1.0) -> dict:
+def remember(scope: str, statement: str, type: str = "other", confidence: float = 1.0) -> dict:
     """
-    Store a durable fact worth keeping across sessions: a user preference, a
-    convention, or a settled project decision. Use scope='global' for
-    user-level knowledge that applies everywhere (preferences, working style),
-    or a project name for a fact specific to that project. Returns the stored
-    fact (id, scope, statement, confidence, timestamps) — check the scope landed
-    as you intended.
+    Store a durable fact worth keeping across sessions. Use scope='global' for
+    user-level knowledge that applies everywhere (preferences, working style), or
+    a project name for a fact specific to that project. `type` is one of:
+    preference | decision | constraint | reference | person | project | other —
+    use 'preference' for user working-style facts (they form the profile shown in
+    every project). Returns the stored fact — check the scope/type landed as you
+    intended; a `hint` is included if the statement looks misplaced.
     """
-    fid = db_remember(conn, scope, statement, confidence)
-    return db_get_fact(conn, fid)
+    fid = db_remember(conn, scope, statement, confidence, type=type)
+    result = db_get_fact(conn, fid)
+    if scope != "global" and _looks_user_level(statement):
+        result["hint"] = (
+            "This looks user-level (a preference / working style). If it applies "
+            "across all projects, consider scope='global' and type='preference' so "
+            "it surfaces everywhere via the profile."
+        )
+    return result
 
 
 @mcp.tool()
-def recall(query: str, scope: str | None = None, as_of: str | None = None, limit: int = 10) -> list[dict]:
+def recall(query: str, scope: str | None = None, as_of: str | None = None,
+           limit: int = 10, type: str | None = None) -> list[dict]:
     """
     Search durable facts (not raw observations), ranked by decayed confidence.
     Scope modes: omit scope for global (user-level) facts only; pass a project
     name for that project's facts PLUS your global facts; pass scope='all' to
-    search across every project. Pass as_of (an ISO-8601 timestamp) to see what
-    was believed at a past time. Each result includes effective_confidence and
-    age_days so you can judge staleness.
+    search across every project. Pass `type` to filter (preference | decision |
+    constraint | reference | person | project | other). Pass as_of (an ISO-8601
+    timestamp) to see what was believed at a past time. Each result includes
+    effective_confidence and age_days so you can judge staleness.
     """
     parsed = None
     if as_of is not None:
@@ -193,7 +216,7 @@ def recall(query: str, scope: str | None = None, as_of: str | None = None, limit
                 f"as_of must be an ISO-8601 timestamp "
                 f"(e.g. 2026-06-11T00:00:00+00:00), got '{as_of}'."
             )
-    return db_recall(conn, query, scope=scope, as_of=parsed, limit=limit)
+    return db_recall(conn, query, scope=scope, as_of=parsed, limit=limit, type=type)
 
 
 @mcp.tool()
@@ -214,6 +237,7 @@ def supersede(old_fact_id: str, new_statement: str, scope: str | None = None,
         id=mint_id(conn, "f", "global"),
         scope=scope if scope is not None else old["scope"],
         statement=new_statement,
+        type=old["type"],
         confidence=confidence,
         t_created=now, last_confirmed_at=now, created_at=now, updated_at=now,
     )
@@ -235,14 +259,16 @@ def forget(fact_id: str) -> dict:
 
 
 @mcp.tool()
-def list_facts(scope: str | None = None, include_invalid: bool = False, limit: int = 50) -> list[dict]:
+def list_facts(scope: str | None = None, include_invalid: bool = False, limit: int = 50,
+               type: str | None = None) -> list[dict]:
     """
     Browse stored facts (enumerate, not search). Omit scope to list every scope;
-    pass a project name or 'global' to filter. Set include_invalid=True to also
-    show forgotten/superseded facts. Ordered newest first; each carries
-    effective_confidence and age_days.
+    pass a project name or 'global' to filter. Pass `type` to filter by category
+    (preference | decision | constraint | reference | person | project | other).
+    Set include_invalid=True to also show forgotten/superseded facts. Ordered
+    newest first; each carries effective_confidence and age_days.
     """
-    return db_list_facts(conn, scope=scope, include_invalid=include_invalid, limit=limit)
+    return db_list_facts(conn, scope=scope, include_invalid=include_invalid, limit=limit, type=type)
 
 
 @mcp.tool()
