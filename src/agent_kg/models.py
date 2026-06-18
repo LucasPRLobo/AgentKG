@@ -39,3 +39,12 @@ class Fact(pydantic.BaseModel):
     supersedes: str | None = None
     created_at: datetime
     updated_at: datetime
+
+class Entity(pydantic.BaseModel):
+    id: str
+    type: str
+    name: str
+    scope: str = "global"
+    created_at: datetime
+    updated_at: datetime
+    t_invalid: datetime | None = None

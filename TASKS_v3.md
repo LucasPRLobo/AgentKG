@@ -78,24 +78,44 @@ Organizing principle: **every prose-protocol norm an agent can violate silently 
 
 ---
 
-## Wave 3 — Entities + relationships · the architectural lift  → W2
-*Right direction (triple columns reserved; validated by schema research). ⚠ Research also flagged automated KG construction FAILS at identity resolution — build with "propose, don't auto-commit". Never auto-merge "David" and "David Silver".*
+## Wave 3 — Entities + relationships · the architectural lift ✅ COMPLETE (verified on real-DB backup 2026-06-18)
+**Design SETTLED by `entity_schema_research` (2026-06-18):** Option B — facts stay first-class statements; entities attach via a many-to-many **`fact_entities` link table** (Hogan two-table pattern), NOT the reserved s/p/o columns. Entities are **global-scoped by default** (one shared node across projects → cross-project rollup). Identity resolution is **propose-don't-auto-commit**: exact name+type → auto-link; cross-name/fuzzy → surface as proposal, never auto-merge. Merges are **non-destructive redirects** (reversible). Thin first cut: **manual linking + exact-match auto; embedding-based candidate generation DEFERRED** to a later wave.
+⚠ Confidence gate alone is insufficient (research: "confidently-wrong" links) — keep every merge reversible.
 
-### ☐ W3-1 · `entities` table + model
-**How:** `entities(id, type, name, scope, created_at, updated_at)` where type ∈ {person, paper, project, file, concept, ...}. Human-readable string ids via `mint_id` (e.g. `ent/person/david`). Identity is by explicit name within type — dedup by name, NOT auto-resolution.
-**Done when:** entities can be created and listed; no auto-merge.
+### ☑ W3-1 · Entity schema + model  *(migration)*
+**File:** `db.py` (executescript + migration loop) + `models.py`.
+**How:** four additive tables (idempotent, same pattern as prior migrations):
+- `entities(id, type, name, scope, created_at, updated_at, t_invalid)` — `scope` defaults `'global'`; `type` ∈ person|paper|project|file|concept|other; id via `mint_id` (kind `e`, scope `global` → `global/e1`, or slug `ent/<type>/<name>`).
+- `entity_aliases(entity_id, alias, PRIMARY KEY(entity_id, alias))` — sameAs/akas.
+- `entity_redirects(from_id, to_id, created_at)` — non-destructive merge.
+- `fact_entities(fact_id, entity_id, role, PRIMARY KEY(fact_id, entity_id, role))` — the link table.
+- `Entity` pydantic model.
+**Done when:** migration runs idempotently on a real-DB backup, data intact; tables present; `Entity(**row)` round-trips.
 
-### ☐ W3-2 · Fact↔entity edges
-**How:** `fact_entities(fact_id, entity_id, role)` — a fact can be "about" multiple entities. Reuse the reserved `facts.subject/predicate/object` columns OR this link table (decide: link table is cleaner for many-to-many). 
-**Done when:** a fact attaches to ≥1 entity; query "facts about entity X" works.
+### ☑ W3-2 · Entity create + fact linking (manual)  → W3-1
+**File:** `db.py` + `server.py`.
+**How:**
+- `db.upsert_entity` / `db.link_fact_entity(fact_id, entity_id, role)` / `db.list_entities(type=None, scope=None)`.
+- Tools: `create_entity(name, type, scope='global')` — **exact (name,type) match → return existing (auto)**; `link_fact(fact_id, entity_name_or_id, role='about')` — resolve/create then link; `list_entities(...)`.
+- Loud validation: unknown fact_id raises (reuse the pattern).
+**Done when:** a fact links to ≥1 entity; exact-name re-create returns the same node (no dup); linking unknown fact fails loudly.
 
-### ☐ W3-3 · Parse `[[...]]` into entity links  *(propose, confirm)*
-**How:** on `remember`, detect `[[Name]]` / `[[type:Name]]` in statement → propose entity links; create entities if new (cheap), but return them for confirmation rather than silently merging into existing similarly-named entities. Resolves the consumer's inert-syntax confusion.
-**Done when:** `[[David]]` in a statement creates/links a person entity; near-duplicate names are surfaced, not auto-merged.
+### ☑ W3-3 · Propose-don't-auto-commit resolution  → W3-2
+**File:** `db.py` + `server.py`.
+**How:** on `create_entity`/`link_fact`, after the exact-match check, run a **candidate scan** (FTS/`LIKE` over names + aliases, same type) → if near-matches exist but no exact, **return `{"created": <new>, "candidates": [...], "hint": "possible duplicates — confirm or merge_entities"}`** rather than silently merging. Never auto-merge cross-name. (Embedding similarity deferred.)
+**Done when:** creating "David Silver" when "David" exists creates the new one BUT surfaces "David" as a candidate; exact "David" reuses silently.
 
-### ☐ W3-4 · Entity-centric query + cross-project rollup
-**How:** `get_entity(name_or_id)` → the entity + all facts attached across all projects ("show everything about David", "which projects touch PAC learning"). This is what turns silos into the shared view.
-**Done when:** one call returns an entity's full cross-project fact set.
+### ☑ W3-4 · Entity query + cross-project rollup + non-destructive merge  → W3-2
+**File:** `db.py` + `server.py`.
+**How:**
+- `get_entity(name_or_id)` → entity (following redirects) + ALL linked facts across every project, grouped by fact scope ("show everything about David" / "which projects touch PAC"). 
+- `merge_entities(from_id, to_id)` → write an `entity_redirects` row, re-point `fact_entities` from→to, set `from` entity `t_invalid` (kept, not deleted). Reversible. Confirmation-gated (the agent calls it deliberately).
+- `add_alias(entity_id, alias)`.
+**Done when:** get_entity returns cross-project facts; merge redirects + re-points non-destructively; a redirected id still resolves via get_entity.
+
+### ☑ W3-5 · `[[...]]` auto-link in remember  *(optional convenience)*  → W3-2/W3-3
+**How:** detect `[[Name]]` / `[[type:Name]]` in a remembered statement → propose entity links via the W3-3 path (create-or-link, surface candidates). Resolves the consumer's inert-syntax confusion. Lowest priority in the wave; can ship after W3-4.
+**Done when:** `[[David]]` in a statement links the fact to a David entity (exact) or surfaces candidates (fuzzy).
 
 ---
 

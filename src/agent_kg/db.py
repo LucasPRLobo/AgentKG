@@ -2,7 +2,7 @@ import sqlite3
 import math
 from datetime import datetime, timezone
 from pathlib import Path
-from .models import Node, Observation, Fact
+from .models import Node, Observation, Fact, Entity
 
 
 LAMBDA = math.log(2) / 90  # 90-day half-life
@@ -65,6 +65,35 @@ def init_db(path: str | Path) -> sqlite3.Connection:
             kind  TEXT NOT NULL,
             n     INTEGER NOT NULL,
             PRIMARY KEY (scope, kind)
+        );
+
+        CREATE TABLE IF NOT EXISTS entities (
+            id         TEXT PRIMARY KEY,
+            type       TEXT NOT NULL,
+            name       TEXT NOT NULL,
+            scope      TEXT NOT NULL DEFAULT 'global',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            t_invalid  TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS entity_aliases (
+            entity_id TEXT NOT NULL REFERENCES entities(id),
+            alias     TEXT NOT NULL,
+            PRIMARY KEY (entity_id, alias)
+        );
+
+        CREATE TABLE IF NOT EXISTS entity_redirects (
+            from_id    TEXT PRIMARY KEY REFERENCES entities(id),
+            to_id      TEXT NOT NULL REFERENCES entities(id),
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS fact_entities (
+            fact_id   TEXT NOT NULL REFERENCES facts(id),
+            entity_id TEXT NOT NULL REFERENCES entities(id),
+            role      TEXT NOT NULL DEFAULT 'about',
+            PRIMARY KEY (fact_id, entity_id, role)
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS obs_fts USING fts5(
@@ -410,3 +439,180 @@ def list_observations(conn: sqlite3.Connection, project: str | None = None,
     sql += " ORDER BY created_at DESC LIMIT ?"
     params.append(limit)
     return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+# ---- entities (Wave 3) ----
+
+def upsert_entity(conn: sqlite3.Connection, entity: Entity) -> None:
+    conn.execute(
+        """
+        INSERT INTO entities (id, type, name, scope, created_at, updated_at, t_invalid)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name       = excluded.name,
+            type       = excluded.type,
+            scope      = excluded.scope,
+            updated_at = excluded.updated_at,
+            t_invalid  = excluded.t_invalid
+        """,
+        (entity.id, entity.type, entity.name, entity.scope,
+         entity.created_at.isoformat(), entity.updated_at.isoformat(),
+         entity.t_invalid.isoformat() if entity.t_invalid else None),
+    )
+    conn.commit()
+
+
+def find_entity_exact(conn: sqlite3.Connection, name: str, type: str) -> dict | None:
+    """Exact identity: same (name, type) among live entities, or a matching alias."""
+    row = conn.execute(
+        "SELECT * FROM entities WHERE name = ? AND type = ? AND t_invalid IS NULL",
+        (name, type),
+    ).fetchone()
+    if row:
+        return dict(row)
+    row = conn.execute(
+        """
+        SELECT e.* FROM entities e
+        JOIN entity_aliases a ON a.entity_id = e.id
+        WHERE a.alias = ? AND e.type = ? AND e.t_invalid IS NULL
+        """,
+        (name, type),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def find_entity_candidates(conn: sqlite3.Connection, name: str, type: str, limit: int = 5) -> list[dict]:
+    """Fuzzy near-matches (substring either direction), same type, live, excluding exact.
+    Crude on purpose — embedding-based candidate generation is deferred."""
+    rows = conn.execute(
+        """
+        SELECT * FROM entities
+        WHERE type = ? AND t_invalid IS NULL AND name <> ?
+          AND (name LIKE ? OR ? LIKE '%' || name || '%')
+        LIMIT ?
+        """,
+        (type, name, f"%{name}%", name, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def link_fact_entity(conn: sqlite3.Connection, fact_id: str, entity_id: str, role: str = "about") -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO fact_entities (fact_id, entity_id, role) VALUES (?, ?, ?)",
+        (fact_id, entity_id, role),
+    )
+    conn.commit()
+
+
+def list_entities(conn: sqlite3.Connection, type: str | None = None,
+                  scope: str | None = None, limit: int = 50) -> list[dict]:
+    clauses, params = ["t_invalid IS NULL"], []
+    if type is not None:
+        clauses.append("type = ?")
+        params.append(type)
+    if scope is not None:
+        clauses.append("scope = ?")
+        params.append(scope)
+    sql = "SELECT * FROM entities WHERE " + " AND ".join(clauses) + " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def resolve_entity_id(conn: sqlite3.Connection, entity_id: str) -> str:
+    """Follow merge redirects (transitively) to the surviving entity id."""
+    seen = set()
+    while entity_id not in seen:
+        seen.add(entity_id)
+        row = conn.execute("SELECT to_id FROM entity_redirects WHERE from_id = ?", (entity_id,)).fetchone()
+        if not row:
+            return entity_id
+        entity_id = row["to_id"]
+    return entity_id  # cycle guard
+
+
+def _redirect_closure(conn: sqlite3.Connection, target_id: str) -> set:
+    """All entity ids that resolve to target_id (target + everything merged into it)."""
+    ids = {target_id}
+    changed = True
+    while changed:
+        changed = False
+        placeholders = ",".join("?" * len(ids))
+        rows = conn.execute(
+            f"SELECT from_id FROM entity_redirects WHERE to_id IN ({placeholders})", tuple(ids)
+        ).fetchall()
+        for r in rows:
+            if r["from_id"] not in ids:
+                ids.add(r["from_id"])
+                changed = True
+    return ids
+
+
+def add_alias(conn: sqlite3.Connection, entity_id: str, alias: str) -> None:
+    conn.execute("INSERT OR IGNORE INTO entity_aliases (entity_id, alias) VALUES (?, ?)", (entity_id, alias))
+    conn.commit()
+
+
+def merge_entities(conn: sqlite3.Connection, from_id: str, to_id: str) -> None:
+    """Non-destructive merge: redirect from_id -> surviving to_id, keep the merged
+    name as an alias, invalidate the merged node. Fact links are NOT moved — queries
+    resolve through the redirect closure — so the merge is fully reversible (drop the
+    redirect row + clear t_invalid)."""
+    to_final = resolve_entity_id(conn, to_id)
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT OR REPLACE INTO entity_redirects (from_id, to_id, created_at) VALUES (?, ?, ?)",
+        (from_id, to_final, now),
+    )
+    frow = conn.execute("SELECT name FROM entities WHERE id = ?", (from_id,)).fetchone()
+    if frow:
+        conn.execute(
+            "INSERT OR IGNORE INTO entity_aliases (entity_id, alias) VALUES (?, ?)",
+            (to_final, frow["name"]),
+        )
+    conn.execute("UPDATE entities SET t_invalid = ?, updated_at = ? WHERE id = ?", (now, now, from_id))
+    conn.commit()
+
+
+def get_entity(conn: sqlite3.Connection, name_or_id: str) -> dict | None:
+    """Resolve an entity (by id following redirects, or by name/alias) and return it
+    with ALL live facts linked to it across every project, grouped by scope."""
+    row = conn.execute("SELECT 1 FROM entities WHERE id = ?", (name_or_id,)).fetchone()
+    if row:
+        target = resolve_entity_id(conn, name_or_id)
+    else:
+        r = conn.execute(
+            "SELECT id FROM entities WHERE name = ? AND t_invalid IS NULL LIMIT 1", (name_or_id,)
+        ).fetchone()
+        if not r:
+            r = conn.execute(
+                "SELECT entity_id AS id FROM entity_aliases WHERE alias = ? LIMIT 1", (name_or_id,)
+            ).fetchone()
+        if not r:
+            return None
+        target = resolve_entity_id(conn, r["id"])
+
+    ent = dict(conn.execute("SELECT * FROM entities WHERE id = ?", (target,)).fetchone())
+    ids = _redirect_closure(conn, target)
+    placeholders = ",".join("?" * len(ids))
+    frows = conn.execute(
+        f"""
+        SELECT DISTINCT f.* FROM facts f
+        JOIN fact_entities fe ON fe.fact_id = f.id
+        WHERE fe.entity_id IN ({placeholders}) AND f.t_invalid IS NULL
+        """,
+        tuple(ids),
+    ).fetchall()
+    now = datetime.now(timezone.utc)
+    facts = [_enrich_fact(dict(r), now) for r in frows]
+    by_scope: dict = {}
+    for fct in facts:
+        by_scope.setdefault(fct["scope"], []).append(fct["id"])
+    aliases = [r["alias"] for r in conn.execute(
+        "SELECT alias FROM entity_aliases WHERE entity_id = ?", (target,)).fetchall()]
+    return {
+        "entity": ent,
+        "aliases": aliases,
+        "facts": facts,
+        "facts_by_scope": by_scope,
+        "resolved_id": target,
+    }
